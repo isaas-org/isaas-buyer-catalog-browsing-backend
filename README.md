@@ -6,6 +6,7 @@ Spring Boot API that lets buyer companies browse and search the iSaaS catalog. I
 
 - Java 21, Spring Boot 4.1, Maven (wrapper included)
 - Spring Web MVC, Data JPA, Validation, Actuator
+- Spring Security as an OAuth2 resource server (Auth0)
 - PostgreSQL 18 (Neon in production)
 
 ## Running locally
@@ -36,8 +37,34 @@ The defaults below are the **local development configuration**: they point at th
 | `DATABASE_USERNAME` | `postgres` | |
 | `DATABASE_PASSWORD` | `postgres` | |
 | `PORT` | `8081` | The vendor backend uses 8082 so both can run side by side |
+| `AUTH0_ISSUER_URI` | `https://isaas-dev.us.auth0.com/` | Auth0 tenant; the trailing slash must match the token's `iss` |
+| `AUTH0_AUDIENCE` | `https://api.isaas/buyer` | The buyer API's identifier in Auth0 |
 
 `spring.jpa.hibernate.ddl-auto` is `none`: migrations belong to `isaas-database`.
+
+## Authentication and authorization
+
+Every endpoint except `/actuator/health` and `/actuator/info` needs `Authorization: Bearer <token>`, where the token is either:
+
+- an **Auth0 access token** for the buyer API, from the buyer frontend's login (tenant config in [`isaas-auth0-config`](https://github.com/isaas-org/isaas-auth0-config)), or
+- a **personal access token** (`isaas_bpat_...`) that an agent app uses to act as one buyer user.
+
+Public catalog browsing is meant to stay anonymous; it will be opened up when the catalog endpoints are added.
+
+Auth0 only says who the caller is. Which buyer company they belong to and their role come from their `buyer_companies.buyer_users` row, looked up on every request. On first login the token's subject is bound to an invited or seeded row with the same email, only if the token marks the email verified. The company a request acts on is always the caller's own; `/company/...` never takes a company ID.
+
+A buyer company starts `pending` and `unverified`. Its first verification document moves it to `pending` review; staff verify it, then activate it. Only an active company can subscribe or add payment methods (enforced by the database).
+
+| Endpoint | Who |
+|----------|-----|
+| `GET /me` | Anyone signed in, or a token. Membership and staff role, or nulls for an unaffiliated user |
+| `POST /companies`, `GET /companies?q=`, `POST /companies/{id}/join-requests`, `GET /me/join-requests` | A signed-in user with a verified email who isn't a member yet: create a company (as its admin), or ask to join an active one |
+| `GET /company`, `GET /company/members`, `GET /company/verification-documents` | Any active member |
+| `POST /company/invitations`, `PATCH /company/members/{id}`, `GET /company/join-requests`, `POST /company/join-requests/{id}/approve` and `/reject`, `POST /company/verification-documents` | Company admins. A company always keeps one active admin |
+| `POST`, `GET /me/access-tokens`, `DELETE /me/access-tokens/{id}` | A signed-in member (not a token). The token value is returned once; at most 90 days |
+| `/staff/companies...`, `/staff/verification-documents/{id}/review` | Active staff (`platform.staff_users`), signed in. Verify, then activate |
+
+Errors are RFC 9457 problem details with a `code`, for example `NOT_A_MEMBER`, `ADMIN_REQUIRED`, `LAST_ADMIN`. Rules the database enforces (company activation, the join request gate, unique emails) come back as `409` with the database's message and the `constraint` name; they aren't re-checked in Java.
 
 ## Tests
 
@@ -45,7 +72,7 @@ The defaults below are the **local development configuration**: they point at th
 ./mvnw verify
 ```
 
-The context-load test needs a reachable Postgres at `DATABASE_URL`. CI (`.github/workflows/test.yml`) provides one as a `postgres:18` service container on every PR and every push to `feature/**`.
+The tests are integration tests against the real schema: they need a Postgres at `DATABASE_URL` with `isaas-database`'s migrations applied (`dbmate up`), and they never call Auth0 (logins are simulated with Spring Security's `jwt()` test support). Each test writes its own uniquely named rows, so no cleanup is needed. CI (`.github/workflows/test.yml`) runs a `postgres:18` service container, applies the migrations from `isaas-database`'s `main`, then runs `./mvnw verify` on every PR and every push to `feature/**`.
 
 CI reads that database's connection details from three GitHub Actions secrets. They are set as organization secrets on `isaas-org` (Organization settings -> Secrets and variables -> Actions); a repository secret with the same name would override them. A `check-config` job fails with a clear message if any are missing.
 
